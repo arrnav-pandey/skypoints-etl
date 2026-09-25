@@ -102,16 +102,30 @@ def stage_members(
 def _recency_key(member: StagedMember) -> tuple:
     """Ordering used to decide which duplicate is the "latest" record.
 
-    The feed carries no explicit change timestamp, so recency is derived from
-    the strongest available evidence, most trustworthy first:
+    **The source provides no record-version timestamp.** Nothing in either feed
+    says when a row was last changed, so "latest" cannot be read directly and
+    has to be approximated. The ordering below is that approximation, not a
+    fact about the data:
 
-    1. batch date -- a later delivery supersedes an earlier one;
-    2. last flight date -- the most recent real member activity;
-    3. enrollment date -- re-enrolment after a move;
-    4. line number -- within one file, later physically wins, which keeps the
-       resolution deterministic instead of dependent on iteration order.
+    1. **batch date** -- a later delivery supersedes an earlier one. This is
+       the only genuinely authoritative signal here, because it describes when
+       we received the row rather than anything about the member.
+    2. **last flight date** -- an *assumption*, and the debatable one. It is a
+       business date, not a version marker, so it can disagree with arrival
+       order: a row delivered today reporting an old flight will lose to a row
+       delivered last week reporting a recent one. That is deliberate for this
+       feed, where a member's most recent activity is the best available proxy
+       for which profile is current, but it is an inference and it is the first
+       thing to revisit if the source ever supplies a change timestamp.
+    3. **enrollment date** -- re-enrolment after a move.
+    4. **line number** -- within one file, later physically wins. Present purely
+       so the result is deterministic; without it two runs over the same file
+       could disagree.
 
-    Absent dates sort lowest so a fully-populated record beats a sparse one.
+    Absent dates sort lowest, so a fully-populated record beats a sparse one.
+
+    If the source can add a ``LAST_UPDATED`` column, this collapses to that
+    single field and every assumption above disappears.
     """
     return (
         member.batch_date or date.min,

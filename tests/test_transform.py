@@ -182,3 +182,38 @@ def test_distinct_members_are_all_kept():
         resolver.add(_member(f"2234{i}", "IND", date(2024, 1, 1), i))
 
     assert len(list(resolver.winners())) == 5
+
+
+def test_later_batch_beats_a_more_recent_flight_date():
+    # Arrival order is authoritative where it exists: a row delivered in a
+    # later batch supersedes an earlier one even if it reports an older flight.
+    resolver = LatestRecordResolver()
+
+    early = _member("223457", "USA", date(2024, 1, 30), 2)
+    early.batch_date = date(2024, 1, 31)
+    late = _member("223457", "IND", date(2023, 11, 15), 3)
+    late.batch_date = date(2024, 2, 1)
+
+    resolver.add(early)
+    resolver.add(late)
+
+    assert next(resolver.winners()).country_code == "IND"
+
+
+def test_within_one_batch_the_more_recent_flight_wins_by_assumption():
+    # Documents a known limitation rather than hiding it. With no version
+    # timestamp and identical batch dates, the pipeline falls back to
+    # last_flight_date - a business date, not a record version. Two rows
+    # delivered together are ordered by member activity, which is an inference.
+    #
+    # If the source ever supplies LAST_UPDATED, this assumption should go and
+    # this test should be replaced.
+    resolver = LatestRecordResolver()
+
+    stale_activity = _member("223457", "USA", date(2023, 11, 15), 2)
+    recent_activity = _member("223457", "IND", date(2024, 1, 30), 3)
+
+    resolver.add(stale_activity)
+    resolver.add(recent_activity)
+
+    assert next(resolver.winners()).country_code == "IND"

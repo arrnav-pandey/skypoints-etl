@@ -20,11 +20,25 @@ SET BATCH_DATE = '2024-01-15';
 -- -----------------------------------------------------------------------------
 -- Step 1: one surviving row per member
 -- -----------------------------------------------------------------------------
--- The feed carries no change timestamp, so recency is derived from the best
--- available evidence in priority order: batch date, then real member activity
--- (last flight), then enrolment, then physical file position. The final tie-
--- break on SOURCE_FILE_ROW matters: without it the result is non-deterministic
--- and two runs over the same file can disagree.
+-- The source provides NO record-version timestamp. Nothing in the feed says
+-- when a row was last changed, so "latest" cannot be read directly and has to
+-- be approximated. The ordering below is that approximation, not a fact:
+--
+--   BATCH_DATE        authoritative - when we received the row.
+--   LAST_FLIGHT_DATE  an assumption, and the debatable one. It is a business
+--                     date, not a version marker, so it can disagree with
+--                     arrival order: a row delivered today reporting an old
+--                     flight loses to one delivered last week reporting a
+--                     recent flight. Deliberate for this feed, where recent
+--                     activity is the best available proxy for the current
+--                     profile - but an inference, and the first thing to drop
+--                     if the source ever supplies a change timestamp.
+--   ENROLLMENT_DATE   re-enrolment after a move.
+--   SOURCE_FILE_ROW   determinism only. Without it two runs over the same file
+--                     can disagree.
+--
+-- If the source can add LAST_UPDATED, this collapses to ORDER BY LAST_UPDATED
+-- DESC and every assumption above disappears.
 CREATE OR REPLACE TEMPORARY TABLE SKYPOINTS_STG.TMP_LATEST_MEMBER AS
 SELECT * EXCLUDE (RN)
 FROM (

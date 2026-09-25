@@ -45,11 +45,16 @@ CLUSTER BY (BATCH_DATE, COUNTRY_CODE)
 COMMENT = 'Immutable landing copy of the per-country member feeds, schema-agnostic.';
 
 -- -----------------------------------------------------------------------------
--- Reference data: the source contracts
+-- Reference data: the column and date contract
 -- -----------------------------------------------------------------------------
--- One row per (country, source column). Onboarding a market becomes an INSERT
--- by a data steward instead of a deployment by an engineer -- which matters for
--- a loyalty programme that adds partner countries as a matter of course.
+-- One row per (country, source column). This covers the column mapping and the
+-- date encoding only -- file format, text encoding and worksheet selection are
+-- properties of the ingestion layer that lands the file, not of the conforming
+-- SQL, and live with the loader (see skypoints.sources.SourceContract).
+--
+-- Onboarding a market becomes an INSERT by a data steward instead of a
+-- deployment by an engineer, which matters for a loyalty programme that adds
+-- partner countries as a matter of course.
 CREATE TABLE IF NOT EXISTS SKYPOINTS_STG.REF_SOURCE_CONTRACT (
     COUNTRY_CODE       VARCHAR(3)   NOT NULL,
     SOURCE_COLUMN      VARCHAR(100) NOT NULL,   -- header as the source writes it
@@ -259,7 +264,7 @@ FROM typed t;
 -- ID 1 is Sam in USA, Vikas in IND and Mike in AUS. Three different people,
 -- one identifier. Two readings are possible and the data cannot separate them:
 -- either these members relocated, or each country numbers its members
--- independently. The names make the second overwhelmingly likely.
+-- independently.
 --
 -- The consequence is that MEMBER_ID alone cannot be the key, which is why the
 -- per-country tables are keyed on (COUNTRY_CODE, MEMBER_ID). This is a genuine
@@ -275,8 +280,10 @@ SELECT
     COUNT(DISTINCT COUNTRY_CODE)         AS COUNTRY_COUNT,
     ARRAY_AGG(DISTINCT COUNTRY_CODE)     AS COUNTRIES,
     ARRAY_AGG(MEMBER_NAME)               AS NAMES,
-    -- Different names under one ID is near-certain evidence of independent
-    -- numbering rather than a relocation.
+    -- Differing names under one ID is strong evidence that the ID namespaces
+    -- are not globally stable, so the rows should not be treated as one member
+    -- who relocated. It remains an inference, which is why this is surfaced as
+    -- a column for a human to weigh rather than acted on automatically.
     COUNT(DISTINCT MEMBER_NAME) > 1      AS NAMES_DIFFER
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
 WHERE MEMBER_ID IS NOT NULL

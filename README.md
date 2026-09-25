@@ -23,7 +23,7 @@ redemptions.json ─┘
 python3.13 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 
-.venv/bin/python -m pytest -q          # 104 tests
+.venv/bin/python -m pytest -q          # 131 tests
 ```
 
 **The supplied country feeds** (`USA.csv`, `IND.csv`, `AUS.xlsx`):
@@ -59,8 +59,15 @@ Outputs: one CSV per country table, `redemption_txn.csv`, `quarantine.csv` and
 
 Both a SQL and a Python implementation are provided. The SQL is the production
 path on Snowflake; the Python is the same logic as a dependency-light, testable
-pipeline so the behaviour can be demonstrated and unit-tested without a
-warehouse attached.
+reference so the behaviour can be demonstrated and unit-tested without a
+warehouse attached. "Same logic" is checked rather than asserted —
+[tests/test_sql_parity.py](tests/test_sql_parity.py) transcribes the SQL
+expressions and compares them against the Python functions across leap-day
+birthdays, birthday boundaries and a full year of batch dates.
+
+The SQL has **not** been executed against a live Snowflake account; it is
+syntax-checked against the documentation and its logic is covered by the Python
+tests.
 
 ---
 
@@ -133,10 +140,12 @@ Both readings cannot be satisfied at once:
 
 The pipeline takes the second, because the failure mode is recoverable and the
 first is not. Collisions are **reported, never auto-resolved** — `run_report.json`
-lists them and `V_ID_COLLISIONS` flags whether the names differ, which is
-near-certain evidence of independent numbering rather than relocation. If the
-source can supply a global member ID, the key becomes that ID and relocation
-handling works exactly as the brief describes.
+lists them and `V_ID_COLLISIONS` flags whether the names differ. Differing names
+under one ID is strong evidence that the ID namespaces are not globally stable,
+though it remains an inference, which is why it is surfaced for a human to weigh
+rather than acted on automatically. If the source can supply a global member ID,
+the key becomes that ID and relocation handling works exactly as the brief
+describes.
 
 ### Discrepancies in the PDF itself
 
@@ -172,6 +181,16 @@ silently exists twice and every country-level count is wrong. Moves are detected
 during resolution and the old table reported. The delete runs *after* the insert:
 a duplicate is recoverable, a deleted-and-never-inserted member is data loss.
 
+**"Latest" is an approximation, and it is documented as one.** Neither feed
+carries a record-version timestamp, so recency has to be inferred. Batch date is
+authoritative — it records when a row arrived. After that the pipeline falls
+back to `last_flight_date`, which is a *business* date rather than a version
+marker: within a single batch, the row reporting more recent member activity
+wins. That is a defensible proxy for "which profile is current", but it is an
+inference, and if the source can supply a `LAST_UPDATED` column the ordering
+collapses to that one field and the assumption disappears. There is a test
+pinning the trade-off rather than leaving it implicit.
+
 **Redemptions are deliberately not split by country.** Transactions are global —
 a member in India redeems on a US partner — and a member's country can change,
 which would force transactions to migrate and silently rewrite history.
@@ -197,22 +216,48 @@ across runs.
 
 ## Designing for billions of rows a day
 
-- **Streaming.** Parsers are generators; memory is flat whether the file has 10
-  rows or 10 billion.
+**Where the scale argument actually lives.** The brief specifies billions of
+rows per day, and the honest answer is that **Snowflake is the production-scale
+path**, not the local Python. The Python implementation is a dependency-light
+reference that runs the same logic, is fully tested, and can be demonstrated
+without a warehouse — it is not the billion-row execution engine, and the repo
+does not claim it is.
+
+Concretely, for the Python path:
+
+- **Readers stream.** `iter_source()` is a generator for CSV and XLSX alike, so
+  no file is ever held in memory and a 10-row sample and a large file take the
+  same code path.
+- **Batch-level state is bounded by key space, not row count.** Deduplication
+  keeps one winner per `(country, member_id)`, and `CrossCountryIdTracker`
+  holds a small set of country codes and names per distinct ID rather than the
+  members themselves.
+- **That is still state that grows with distinct IDs.** At hundreds of millions
+  of members it stops being free, which is exactly why the authoritative
+  deduplication (`MERGE`) and collision check (`V_ID_COLLISIONS`) live in the
+  warehouse. Local CSV output is likewise a demonstration sink, not a
+  production one.
+
+For the Snowflake path, which is where the scale claims belong:
+
 - **Set-based SQL, no row-by-row UDFs.** At this volume that is the difference
   between minutes and hours.
 - **Clustering matched to access.** Staging clusters on `(BATCH_DATE,
-  COUNTRY_CODE)` — exactly what routing filters on.
+  COUNTRY_CODE)` — exactly what routing filters on. `REDEMPTION_TXN` clusters
+  on `(TXN_DATE, MEMBER_ID)`.
 - **VARIANT rather than pre-parsed JSON.** Snowflake shreds VARIANT columnar, so
-  flattening touches only the attributes it reads.
+  flattening touches only the attributes it reads. The country feeds land as a
+  VARIANT payload too, since the three sources share no column set.
 - **JSON Lines** is the form to insist on from partners: splittable and
   streamable. Object and array forms are supported so the PDF sample runs as-is.
-- **Bounded-memory uniqueness.** The in-flight tracker stores key hashes, not
-  rows. The authoritative check stays in the warehouse.
 - **Reconciliation, not just success.** `raw = staged + quarantined` catches the
   dropped micro-batch no row-level rule can see. Volume-anomaly detection
   catches a truncated delivery, because a batch that is 10% of yesterday is far
   more likely to be a broken file than a collapse in enrolment.
+
+**Next steps beyond a batch:** Snowpipe for continuous landing, streams and
+tasks to make the staging load incremental, and a `MEMBER_ID` hash to partition
+routing across warehouses.
 
 ---
 
@@ -220,7 +265,7 @@ across runs.
 
 ```
 src/skypoints/
-  sources.py       per-country source contracts, CSV + XLSX readers
+  sources.py       per-country source contracts, streaming CSV + XLSX readers
   spec.py          the pipe-delimited record layout, declared as data
   config.py        country conformance, routing, tunables
   parser.py        streaming flat-file reader
@@ -231,7 +276,7 @@ src/skypoints/
   pipeline.py      orchestration and run report
   cli.py           entry point
 sql/               Snowflake DDL and transformation logic
-tests/             104 tests
+tests/             131 tests, incl. SQL|Python parity checks
 data/incoming/     the files supplied with the assessment, unmodified
 data/sample/       feeds matching the PDF's pipe-delimited spec
 ```

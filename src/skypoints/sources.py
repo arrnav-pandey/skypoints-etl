@@ -358,8 +358,9 @@ class CrossCountryIdTracker:
         """Whether one ID carries more than one member name.
 
         Differing names under a single ID is strong evidence that the ID
-        namespaces are not globally stable, so the records should not be
-        treated as one member who relocated.
+        namespaces are not globally stable, so the rows should not be treated
+        as one member who relocated. It remains an inference, so it is reported
+        for a human to weigh rather than acted on automatically.
         """
         return len(self._names.get(member_id, set())) > 1
 
