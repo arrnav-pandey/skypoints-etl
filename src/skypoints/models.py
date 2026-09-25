@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import date
 from enum import Enum
@@ -77,6 +78,26 @@ class StagedMember:
 
     issues: list[Issue] = field(default_factory=list)
 
+    extras: dict[str, str] = field(default_factory=dict)
+    """Columns a source sends that no specification declares.
+
+    ``IND.csv`` carries ``Individual or Corporate``. Silently dropping a column
+    the source chose to send is how real attributes get lost for months, so
+    unrecognised columns are retained here rather than discarded.
+    """
+
+    @property
+    def member_key(self) -> tuple[str, str]:
+        """The business key, qualified by country.
+
+        ID 1 is Sam in USA, Vikas in IND and Mike in AUS -- three different
+        people sharing one identifier. Keying on ``member_id`` alone would let
+        latest-record-wins merge them into a single member, so country forms
+        part of the key. See :mod:`skypoints.sources` for what this costs when
+        a member genuinely relocates.
+        """
+        return (self.country_code, self.member_id or "")
+
     @property
     def is_valid(self) -> bool:
         return not any(i.severity is Severity.ERROR for i in self.issues)
@@ -109,6 +130,7 @@ class StagedMember:
             "source_file": self.source_file,
             "line_number": self.line_number,
             "batch_date": _iso(self.batch_date),
+            "extras": json.dumps(self.extras) if self.extras else None,
         }
 
 

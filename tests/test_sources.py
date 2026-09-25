@@ -66,6 +66,23 @@ def test_usa_eight_digit_dates_parse_in_the_same_column():
     assert mike.last_flight_date == date(2021, 12, 30)
 
 
+def test_seven_digit_date_is_padded_not_matched_greedily():
+    # '1052022' is 5 January 2022, NOT 5 October 2022.
+    #
+    # A 7-digit MDYYYY value must have lost exactly one leading zero, so its
+    # month is necessarily single-digit: 5 Oct 2022 would have been written
+    # '10052022' with all eight digits and never appeared as seven.
+    #
+    # This matters because strptime matches greedily and does not backtrack
+    # when the greedy read happens to be valid: '%m' takes '10', '%d' takes
+    # '5', and October is returned with no error raised. The width of the
+    # field is the only thing that disambiguates it.
+    john = read_source(INCOMING / "USA.csv")[1]
+
+    assert john.enrollment_date == date(2022, 1, 5)
+    assert john.last_flight_date == date(2022, 1, 15)
+
+
 def test_usa_has_no_date_of_birth_so_age_is_unknown():
     # An entire country ships no DOB. Age must be NULL rather than zero or a
     # guess - a fabricated age would silently corrupt every age-based segment.
