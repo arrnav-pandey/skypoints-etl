@@ -20,7 +20,7 @@ from .config import PipelineConfig
 from .models import Redemption, Severity, StagedMember
 from .parser import FlatFileReader
 from .redemptions import deduplicate, read_redemptions
-from .sources import detect_cross_country_collisions, read_source
+from .sources import CrossCountryIdTracker, iter_source
 from .transform import LatestRecordResolver, route_by_country, stage_members
 from .validation import UniquenessTracker, declared_key_note, summarise
 
@@ -179,13 +179,13 @@ def run_sources(
     issue_counts: Counter[str] = Counter()
     quarantined: list[tuple[dict[str, Any], list[str]]] = []
 
-    everyone: list[StagedMember] = []
+    everyone_tracker = CrossCountryIdTracker()
     by_country: dict[str, LatestRecordResolver] = {}
 
     for path in member_files:
         path = Path(path)
         try:
-            members = read_source(path, config)
+            members = iter_source(path, config)
         except LookupError as exc:
             # An unroutable file is a batch-level problem, not a row-level one.
             report.file_issues.append(f"ERROR unroutable_file: {exc}")
@@ -193,7 +193,7 @@ def run_sources(
 
         for member in members:
             report.members_read += 1
-            everyone.append(member)
+            everyone_tracker.observe(member)
             issue_counts.update(summarise(member.issues))
 
             if not member.is_valid:
@@ -204,17 +204,19 @@ def run_sources(
             resolver = by_country.setdefault(member.country_code, LatestRecordResolver())
             resolver.add(member)
 
-    collisions = detect_cross_country_collisions(everyone)
-    report.id_collisions = {
-        member_id: sorted(m.country_code for m in rows)
-        for member_id, rows in collisions.items()
-    }
-    if collisions:
+    report.id_collisions = everyone_tracker.collisions()
+    if report.id_collisions:
+        ambiguous = [
+            member_id
+            for member_id in report.id_collisions
+            if everyone_tracker.names_differ(member_id)
+        ]
         report.notes.append(
-            f"{len(collisions)} member_id value(s) appear in more than one country. "
-            "They are kept separate under the (country, member_id) key rather than "
-            "merged, because the data cannot distinguish a relocation from two "
-            "countries numbering their members independently."
+            f"{len(report.id_collisions)} member_id value(s) appear in more than one "
+            f"country ({len(ambiguous)} of them under more than one name). They are "
+            "kept separate under the (country, member_id) key rather than merged, "
+            "because the data cannot distinguish a relocation from countries "
+            "numbering their members independently."
         )
 
     winners = [m for resolver in by_country.values() for m in resolver.winners()]
@@ -229,7 +231,7 @@ def run_sources(
 
     report.members_loaded = len(winners)
     report.members_superseded = sum(r.stats.superseded for r in by_country.values())
-    report.distinct_member_keys = len({m.member_key for m in everyone})
+    report.distinct_member_keys = everyone_tracker.distinct_keys
 
     if redemption_file:
         _load_redemptions(redemption_file, config, output_dir, report, issue_counts, quarantined)

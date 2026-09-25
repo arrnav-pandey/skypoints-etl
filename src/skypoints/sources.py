@@ -49,6 +49,7 @@ becomes that ID and relocation handling works as the brief describes.
 from __future__ import annotations
 
 import csv
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -160,13 +161,14 @@ def resolve_contract(path: Path | str) -> SourceContract:
 
 # --- readers --------------------------------------------------------------
 
-def _read_csv_rows(path: Path, contract: SourceContract) -> list[tuple[int, dict]]:
+def _iter_csv_rows(path: Path, contract: SourceContract) -> Iterator[tuple[int, dict]]:
     with path.open("r", encoding=contract.encoding, newline="") as handle:
         reader = csv.DictReader(handle)
-        return [(i, row) for i, row in enumerate(reader, start=2)]
+        for line_number, row in enumerate(reader, start=2):
+            yield line_number, row
 
 
-def _read_xlsx_rows(path: Path, contract: SourceContract) -> list[tuple[int, dict]]:
+def _iter_xlsx_rows(path: Path, contract: SourceContract) -> Iterator[tuple[int, dict]]:
     try:
         import openpyxl
     except ImportError as exc:  # pragma: no cover - environment guard
@@ -176,40 +178,49 @@ def _read_xlsx_rows(path: Path, contract: SourceContract) -> list[tuple[int, dic
         ) from exc
 
     workbook = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    sheet = (
-        workbook[contract.sheet]
-        if isinstance(contract.sheet, str)
-        else workbook.worksheets[contract.sheet]
-    )
+    try:
+        sheet = (
+            workbook[contract.sheet]
+            if isinstance(contract.sheet, str)
+            else workbook.worksheets[contract.sheet]
+        )
+        rows = sheet.iter_rows(values_only=True)
+        headers = list(next(rows))
+        for line_number, values in enumerate(rows, start=2):
+            if all(v is None for v in values):
+                continue
+            yield line_number, dict(zip(headers, values))
+    finally:
+        workbook.close()
 
-    rows = sheet.iter_rows(values_only=True)
-    headers = [h for h in next(rows)]
-    out: list[tuple[int, dict]] = []
-    for line_number, values in enumerate(rows, start=2):
-        if all(v is None for v in values):
-            continue
-        out.append((line_number, dict(zip(headers, values))))
-    workbook.close()
-    return out
+
+def iter_source(
+    path: Path | str, config: PipelineConfig | None = None
+) -> Iterator[StagedMember]:
+    """Stream one country feed as staged members, defects and all.
+
+    Yields rather than returns so the file is never held in memory. This is
+    the entry point the pipeline uses; :func:`read_source` is a convenience
+    for tests and interactive work.
+    """
+    path = Path(path)
+    contract = resolve_contract(path)
+    config = config or PipelineConfig(as_of_date=date.today())
+
+    rows = (
+        _iter_csv_rows(path, contract)
+        if contract.file_format == CSV
+        else _iter_xlsx_rows(path, contract)
+    )
+    for line_number, values in rows:
+        yield _to_member(values, line_number, path.name, contract, config)
 
 
 def read_source(
     path: Path | str, config: PipelineConfig | None = None
 ) -> list[StagedMember]:
-    """Read one country feed into staged members, defects and all."""
-    path = Path(path)
-    contract = resolve_contract(path)
-    config = config or PipelineConfig(as_of_date=date.today())
-
-    raw_rows = (
-        _read_csv_rows(path, contract)
-        if contract.file_format == CSV
-        else _read_xlsx_rows(path, contract)
-    )
-    return [
-        _to_member(values, line_number, path.name, contract, config)
-        for line_number, values in raw_rows
-    ]
+    """Collect :func:`iter_source` into a list. Convenience only."""
+    return list(iter_source(path, config))
 
 
 def _to_member(
@@ -307,15 +318,64 @@ def _validate(member: StagedMember) -> list[Issue]:
     return issues
 
 
-def detect_cross_country_collisions(
-    members: list[StagedMember],
-) -> dict[str, list[StagedMember]]:
-    """Find one ``member_id`` used by more than one country.
+class CrossCountryIdTracker:
+    """Detects one ``member_id`` used by more than one country.
 
-    This is the check that makes the key decision visible instead of implicit.
+    Holds a small set of country codes and names per distinct ID rather than
+    the members themselves, so the memory bound is the number of distinct IDs
+    rather than the number of rows. That is the difference between state that
+    grows with the population and state that grows with the key space -- and it
+    is what lets the surrounding pipeline stream.
+
+    It is still per-distinct-ID state, so at hundreds of millions of members
+    this belongs in the warehouse (``V_ID_COLLISIONS`` in
+    ``sql/08_country_source_ingestion.sql``). This tracker exists to give the
+    local run an in-flight signal, not to be the billion-row implementation.
+    """
+
+    def __init__(self) -> None:
+        self._countries: dict[str, set[str]] = {}
+        self._names: dict[str, set[str]] = {}
+        self._keys: set[tuple[str, str]] = set()
+
+    def observe(self, member: StagedMember) -> None:
+        if not member.member_id:
+            return
+        self._keys.add(member.member_key)
+        self._countries.setdefault(member.member_id, set()).add(member.country_code)
+        if member.member_name:
+            self._names.setdefault(member.member_id, set()).add(member.member_name)
+
+    def collisions(self) -> dict[str, list[str]]:
+        """Member IDs seen in more than one country, with those countries."""
+        return {
+            member_id: sorted(countries)
+            for member_id, countries in self._countries.items()
+            if len(countries) > 1
+        }
+
+    def names_differ(self, member_id: str) -> bool:
+        """Whether one ID carries more than one member name.
+
+        Differing names under a single ID is strong evidence that the ID
+        namespaces are not globally stable, so the records should not be
+        treated as one member who relocated.
+        """
+        return len(self._names.get(member_id, set())) > 1
+
+    @property
+    def distinct_keys(self) -> int:
+        return len(self._keys)
+
+
+def detect_cross_country_collisions(
+    members: Iterable[StagedMember],
+) -> dict[str, list[StagedMember]]:
+    """Eager equivalent of :class:`CrossCountryIdTracker`, for tests.
+
     Two readings are possible for every hit and the data cannot distinguish
     them: either the member relocated (the brief's "moved countries" case), or
-    the two countries simply number their members independently.
+    the two countries number their members independently.
 
     Reported, never auto-resolved. Merging two people who share an ID is
     unrecoverable; leaving them separate and flagged is not.
