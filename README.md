@@ -4,15 +4,15 @@
 
 Incubyte Data Engineer technical assessment.
 
-A daily batch that takes two source feeds — a pipe-delimited flat file of member
-profiles and a semi-structured JSON feed of partner redemptions — validates and
-conforms them, and routes members into per-country target tables.
+A daily batch that ingests member profile feeds and a partner redemption feed,
+validates and conforms them, and routes members into per-country target tables.
 
 ```
-flat file ─┐
-           ├─▶ raw (immutable) ─▶ staging (typed, derived, judged) ─┬─▶ TABLE_INDIA, TABLE_USA, …
-JSON feed ─┘                                                        ├─▶ REDEMPTION_TXN
-                                                                    └─▶ quarantine + run report
+USA.csv  ─┐
+IND.csv  ─┼─▶ raw (immutable) ─▶ staging (typed, derived, judged) ─┬─▶ TABLE_USA, TABLE_INDIA, …
+AUS.xlsx ─┤                                                        ├─▶ REDEMPTION_TXN
+members.dat ─┤                                                     └─▶ quarantine + run report
+redemptions.json ─┘
 ```
 
 ---
@@ -23,27 +23,26 @@ JSON feed ─┘                                                        ├─�
 python3.13 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 
-.venv/bin/python -m pytest -q          # 79 tests
-
-.venv/bin/skypoints run \
-  --members    data/sample/SKYPOINTS_MEMBERS_20240115_10300000.dat \
-  --redemptions data/sample/SKYPOINTS_REDEMPTIONS_20240115_10300000.json \
-  --as-of      2024-01-15 \
-  --out        out
+.venv/bin/python -m pytest -q          # 104 tests
 ```
 
-Outputs land in `out/`: one CSV per country table, `redemption_txn.csv`,
-`quarantine.csv` and `run_report.json`.
+**The supplied country feeds** (`USA.csv`, `IND.csv`, `AUS.xlsx`):
 
-To see the failure paths, run the second sample file — it carries a member who
-relocates mid-batch, a truncated date, an unmappable country, an over-length
-field, a missing mandatory name and a future date:
+```bash
+.venv/bin/skypoints ingest --dir data/incoming --as-of 2022-12-31 --out out
+```
+
+**The pipe-delimited feed + JSON redemptions** described in the PDF:
 
 ```bash
 .venv/bin/skypoints run \
-  --members data/sample/SKYPOINTS_MEMBERS_20240116_10300000.dat \
-  --as-of   2024-01-16 --out out-dirty
+  --members     data/sample/SKYPOINTS_MEMBERS_20240115_10300000.dat \
+  --redemptions data/sample/SKYPOINTS_REDEMPTIONS_20240115_10300000.json \
+  --as-of       2024-01-15 --out out
 ```
+
+Outputs: one CSV per country table, `redemption_txn.csv`, `quarantine.csv` and
+`run_report.json`.
 
 ---
 
@@ -51,148 +50,169 @@ field, a missing mandatory name and a future date:
 
 | # | Deliverable | Where |
 |---|---|---|
-| 1 | DDL for raw, staging and per-country target tables | [sql/01_raw_ddl.sql](sql/01_raw_ddl.sql), [sql/02_staging_ddl.sql](sql/02_staging_ddl.sql), [sql/03_target_ddl.sql](sql/03_target_ddl.sql) |
+| 1 | DDL for raw, staging and per-country target tables | [sql/01_raw_ddl.sql](sql/01_raw_ddl.sql), [sql/02_staging_ddl.sql](sql/02_staging_ddl.sql), [sql/03_target_ddl.sql](sql/03_target_ddl.sql), [sql/08_country_source_ingestion.sql](sql/08_country_source_ingestion.sql) |
 | 2 | Staging load with `Age` and `Stale_Member` | [sql/04_stage_load.sql](sql/04_stage_load.sql), [src/skypoints/transform.py](src/skypoints/transform.py) |
 | 3 | Split into per-country tables, latest record wins | [sql/05_country_split.sql](sql/05_country_split.sql), [src/skypoints/transform.py](src/skypoints/transform.py) |
 | 4 | Flatten the JSON feed + join back to members | [sql/06_redemption_flatten.sql](sql/06_redemption_flatten.sql), [src/skypoints/redemptions.py](src/skypoints/redemptions.py) |
-| 5 | Data validations | [sql/07_validations.sql](sql/07_validations.sql), [src/skypoints/validation.py](src/skypoints/validation.py) |
+| 5 | Data validations | [sql/07_validations.sql](sql/07_validations.sql), [src/skypoints/validation.py](src/skypoints/validation.py), [src/skypoints/sources.py](src/skypoints/sources.py) |
 | 6 | Live demonstration | the CLI above |
 
 Both a SQL and a Python implementation are provided. The SQL is the production
-path on Snowflake; the Python is the same logic expressed as a dependency-free,
-testable pipeline so the behaviour can be demonstrated and unit-tested without a
+path on Snowflake; the Python is the same logic as a dependency-light, testable
+pipeline so the behaviour can be demonstrated and unit-tested without a
 warehouse attached.
 
 ---
 
-## What the sample data actually contains
+## What the supplied data actually contains
 
-Reading the brief carefully, then running its own sample through the parser,
-surfaced five discrepancies. Each is handled explicitly rather than smoothed
-over, because in a real engagement each one is a conversation with the source
-system owner.
+The assessment ships three member files. No two agree on schema, format or date
+encoding, and each one carries a different defect. **Every issue below was found
+by running the files, not by reading them.**
 
-**1. The layout declares 11 columns; the file sends 10.**
-`Post Code` sits at file position 9 in the design document but appears in
-neither the header nor the detail records. Binding columns by ordinal position
-would shift `DOB` and `Is_Active` by one and corrupt every row. Fields are bound
-by *header name*, and the absent column is reported as schema drift.
+### The three contracts
 
-**2. `Member Name` is declared the key column.**
-Two different members can share a name; deduplicating on it would merge distinct
-people and lose one of them. `Member ID` is used as the deduplication key, and
-the divergence is carried in the run report rather than being silently resolved.
+| File | Format | Columns | Dates |
+|---|---|---|---|
+| `USA.csv` | CSV | `ID, Name, TierCode, EnrollmentDate, FlightDate` | `MDYYYY` as a **number** |
+| `IND.csv` | CSV | `ID, Name, DOB, TierCode, EnrollmentDate, Individual or Corporate, Flight Date` | `M/D/YYYY` text |
+| `AUS.xlsx` | XLSX | `Unique ID, Member Name, Tier Type, Date of Birth, Date of Enrollment, Date of Flight` | Excel datetimes + text |
 
-**3. `DOB` is not in the stated date format.**
-`03051985` is not a valid `YYYYMMDD` value — that would be month 19, day 85. It
-is `DDMMYYYY`. Date format is declared per column, with alternates tried in
-order and a warning raised when a fallback fires, so a drifting source is
-visible without rejecting otherwise-valid members.
+### The defects
 
-**4. The intermediate table shows `3051985`.**
-The leading zero is gone: something upstream handled an 8-digit date as a
-number. This gets its own rule (`date_leading_zero_lost`) because the fix is in
-the source system's cast, not in this data — a generic "bad date" error would
-send someone looking in the wrong place.
+**1. Country is carried only by the filename.** No file has a country column.
+An unresolvable filename is refused rather than defaulted — guessing would route
+real members into the wrong country's table.
 
-**5. Country codes are inconsistent.**
-`USA`, `IND` and `CAN` are ISO alpha-3; `PHIL` and `AU` are not. Since country
-determines the target table, an unconformed code is a *routing* failure — the
-member reaches no table at all. Values are conformed to ISO alpha-3 up front, so
-a source later tidying `AU` to `AUS` does not look like every Australian member
-relocating.
+**2. `1052022` is 5 January, not 5 October.** USA dates are `MDYYYY` written as
+numbers, so `6152022` has lost the month's leading zero while `12282021` in the
+same column kept all eight digits. The subtle part: `strptime` matches greedily
+and *does not backtrack when the greedy read is valid* — `%m` takes `10`, `%d`
+takes `5`, and October is returned with no error raised. But 5 October would
+have arrived as `10052022`, eight digits. A 7-digit value has lost exactly one
+leading zero, so only the zero-padded reading is admissible. **My first test
+missed this; running the real file caught it.**
 
-The intermediate table also misspells `Country` as `County` and drops
-`Agent_Name` for four of five members; both are handled (alias, completeness
-warning).
+**3. USA ships no date of birth at all.** `Age` is therefore `NULL` for an
+entire market — never `0`, never estimated. A fabricated age would silently
+corrupt every age-based segment. This is a `WARNING` (`age_underivable`), not a
+rejection: the member is perfectly valid, the attribute simply does not exist.
+
+**4. `AUS` sends the literal string `"NULL"`.** Four characters, not an empty
+cell. Loaded naively it becomes the text `'NULL'`, which is not null and defeats
+every `IS NULL` check downstream.
+
+**5. `AUS` contains `2021-13-13` — month 13.** There is no defensible repair, so
+the record is quarantined with its reason rather than silently shifted into 2022.
+The columns that *did* parse are preserved, so the row can be fixed and replayed.
+
+**6. `IND` carries `Individual or Corporate`**, a column no specification
+mentions. It is retained in an `extras` map rather than dropped — silently
+discarding a column the source chose to send is how real attributes get lost for
+months.
+
+**7. `ID` 1 is Sam in USA, Vikas in IND and Mike in AUS.** Three different
+people, one identifier — see below.
+
+### The identifier contradiction
+
+This is the most consequential finding, and it is a genuine contradiction in the
+assessment rather than something to quietly pick a side on.
+
+The brief requires *"latest record wins when a member has moved countries"*,
+which needs an identifier that is **stable across countries**. The supplied data
+provides no such identifier: IDs 1, 2 and 3 each appear in all three files, with
+different names every time.
+
+Both readings cannot be satisfied at once:
+
+- Key on `member_id` alone → latest-record-wins **merges three different people
+  into one**. Unrecoverable.
+- Key on `(country, member_id)` → distinct people stay distinct, but a genuine
+  relocation looks like two members.
+
+The pipeline takes the second, because the failure mode is recoverable and the
+first is not. Collisions are **reported, never auto-resolved** — `run_report.json`
+lists them and `V_ID_COLLISIONS` flags whether the names differ, which is
+near-certain evidence of independent numbering rather than relocation. If the
+source can supply a global member ID, the key becomes that ID and relocation
+handling works exactly as the brief describes.
+
+### Discrepancies in the PDF itself
+
+The pipe-delimited spec in the PDF also disagrees with its own examples: the
+layout declares 11 columns but the sample sends 10 (no `Post Code`); it names
+`Member Name` as the key column, which cannot be unique; and `DOB` `03051985`
+is `DDMMYYYY`, not the stated `YYYYMMDD` — as `YYYYMMDD` it would be month 19,
+day 85. All three are handled explicitly and documented in
+[src/skypoints/spec.py](src/skypoints/spec.py).
 
 ---
 
 ## Design decisions
 
+**Source differences are data, not code.** Each country's schema, format and
+date encoding is a `SourceContract` ([src/skypoints/sources.py](src/skypoints/sources.py))
+and `REF_SOURCE_CONTRACT` in SQL. One reader serves CSV and XLSX; onboarding a
+market is a new contract, not a new module. Three bespoke readers would have
+tripled the code and guaranteed drift.
+
 **Per-country tables are the requested design, not the one I would choose
-unprompted.** On Snowflake, a single `CURRENT_MEMBER` table clustered by
-`COUNTRY_CODE` prunes partitions just as effectively, with none of the costs: no
-DDL per new market, no N-way `UNION` for global reporting, no schema drift
-between countries, and a relocation becomes an `UPDATE` rather than a
-cross-table `DELETE` + `INSERT`. The arguments that *do* justify physical
-separation are data residency and access control — if India's data must sit in
-an India-region account, or country teams must be structurally unable to read
-each other's members. Those are good reasons; storage layout is not. The brief's
-design is implemented, and `V_MEMBER_GLOBAL` re-unifies it so reporting is not
-punished for the split.
+unprompted.** On Snowflake, a single table clustered by `COUNTRY_CODE` prunes
+partitions just as well, with no DDL per market, no N-way `UNION` for global
+reporting and no schema drift. What *does* justify physical separation is data
+residency and access control — if India's data must sit in an India-region
+account, or country teams must be structurally unable to read each other's
+members. Those are good reasons; storage layout is not. The brief's design is
+implemented, and `V_MEMBER_GLOBAL` re-unifies it so reporting is not punished.
 
 **Relocation is the subtle part of "latest record wins."** A `MERGE` into
-`TABLE_INDIA` resolves which version of the member survives, but it cannot see
-the stale row still sitting in `TABLE_USA` — so the member silently exists in
-two countries and every country-level count is wrong. The pipeline detects moves
-during resolution and reports the table to delete from. The delete runs *after*
-the insert: a duplicate is a recoverable inconsistency, a deleted-and-never-
-inserted member is data loss.
+`TABLE_INDIA` cannot see the stale row still in `TABLE_USA`, so the member
+silently exists twice and every country-level count is wrong. Moves are detected
+during resolution and the old table reported. The delete runs *after* the insert:
+a duplicate is recoverable, a deleted-and-never-inserted member is data loss.
 
 **Redemptions are deliberately not split by country.** Transactions are global —
 a member in India redeems on a US partner — and a member's country can change,
-which would force transactions to migrate between tables and silently rewrite
-history. Country is reached by joining to the member.
+which would force transactions to migrate and silently rewrite history.
 
-**Severity is a product decision, not a technical one.** Blocking on every
-anomaly means the pipeline halts nightly and people start ignoring it; blocking
-on nothing means bad data reaches the business. `ERROR` means the record cannot
-be loaded correctly, so it is quarantined with its reasons. `WARNING` means it
-is loadable but something is degrading. An unknown tier code is a warning — a
-new tier is a plausible marketing decision. An unmappable country is an error —
-the record cannot be routed at all.
+**Severity is a product decision.** Blocking on every anomaly means the pipeline
+halts nightly and people start ignoring it; blocking on nothing means bad data
+reaches the business. `ERROR` quarantines, `WARNING` annotates. An unknown tier
+code warns — a new tier is a plausible marketing decision. An unmappable country
+errors — the record cannot be routed at all.
 
-**Nothing is ever dropped silently.** Rejected rows go to quarantine with their
-reasons, never to `/dev/null`. A row that fails today is often the evidence that
-fixes the source tomorrow, and a quarantine table makes the cost of bad data
-visible instead of hiding it in a row-count discrepancy.
+**Nothing is dropped silently.** Rejected rows go to quarantine with reasons.
+A row that fails today is often the evidence that fixes the source tomorrow.
 
 **Derived values are anchored on the batch date, never `CURRENT_DATE()`.**
-`Age` and `Stale_Member` computed from the wall clock make the table
-non-deterministic: re-running last quarter's batch would produce different
-numbers and no downstream reconciliation could be trusted. There is an
-end-to-end test asserting byte-identical output across runs.
+Otherwise re-running last quarter's batch produces different numbers and no
+reconciliation can be trusted. There is a test asserting byte-identical output
+across runs.
 
 **"Never flown" is not "stale."** `Stale_Member` is `NULL`, not `TRUE`, when
-`Last_Flight_Date` is absent. A member who never flew and a member who has not
-flown in six months need different treatment, and merging them would mis-target
-re-engagement campaigns.
+`Last_Flight_Date` is absent. Merging the two would mis-target re-engagement.
 
 ---
 
 ## Designing for billions of rows a day
 
-*The brief specifies scale, so these are choices, not afterthoughts.*
-
-- **Streaming everywhere.** Nothing materialises the input. Parsers are
-  generators, so memory is flat whether the file has 10 rows or 10 billion, and
-  the sample and production paths are the same code.
-- **Set-based SQL, no row-by-row UDFs.** At this volume the difference between a
-  vectorised expression and a per-row function call is the difference between
-  minutes and hours.
+- **Streaming.** Parsers are generators; memory is flat whether the file has 10
+  rows or 10 billion.
+- **Set-based SQL, no row-by-row UDFs.** At this volume that is the difference
+  between minutes and hours.
 - **Clustering matched to access.** Staging clusters on `(BATCH_DATE,
-  COUNTRY_CODE)` — exactly what the routing step filters on, so each country
-  reads its own micro-partitions. `REDEMPTION_TXN` clusters on `(TXN_DATE,
-  MEMBER_ID)`.
+  COUNTRY_CODE)` — exactly what routing filters on.
 - **VARIANT rather than pre-parsed JSON.** Snowflake shreds VARIANT columnar, so
-  flattening touches only the attributes it reads instead of re-parsing whole
-  documents.
-- **JSON Lines is the form to insist on** from partners: splittable across
-  workers and streamable. Single-object and array forms are supported so the
-  brief's sample runs unmodified.
+  flattening touches only the attributes it reads.
+- **JSON Lines** is the form to insist on from partners: splittable and
+  streamable. Object and array forms are supported so the PDF sample runs as-is.
 - **Bounded-memory uniqueness.** The in-flight tracker stores key hashes, not
-  rows, so its footprint scales with distinct members rather than volume. The
-  authoritative uniqueness check stays in the warehouse.
+  rows. The authoritative check stays in the warehouse.
 - **Reconciliation, not just success.** `raw = staged + quarantined` catches the
-  dropped micro-batch that no row-level rule can see. Volume anomaly detection
-  catches a truncated delivery before it lands, because at this scale a batch
-  that is 10% of yesterday is far more likely to be a broken file than a
-  collapse in enrolment.
-
-**Next steps beyond a batch:** Snowpipe for continuous landing, streams and
-tasks to make the staging load incremental, and a `MEMBER_ID` hash to
-horizontally partition the routing step across warehouses.
+  dropped micro-batch no row-level rule can see. Volume-anomaly detection
+  catches a truncated delivery, because a batch that is 10% of yesterday is far
+  more likely to be a broken file than a collapse in enrolment.
 
 ---
 
@@ -200,7 +220,8 @@ horizontally partition the routing step across warehouses.
 
 ```
 src/skypoints/
-  spec.py          source record layout, declared once as data
+  sources.py       per-country source contracts, CSV + XLSX readers
+  spec.py          the pipe-delimited record layout, declared as data
   config.py        country conformance, routing, tunables
   parser.py        streaming flat-file reader
   coerce.py        type casting that reports instead of raising
@@ -210,8 +231,9 @@ src/skypoints/
   pipeline.py      orchestration and run report
   cli.py           entry point
 sql/               Snowflake DDL and transformation logic
-tests/             79 tests
-data/sample/       clean and defect-carrying sample feeds
+tests/             104 tests
+data/incoming/     the files supplied with the assessment, unmodified
+data/sample/       feeds matching the PDF's pipe-delimited spec
 ```
 
 ---
@@ -223,20 +245,26 @@ deliberate. It was fast at mechanical breadth — Snowflake `MERGE` and `LATERAL
 FLATTEN` syntax, parametrised test scaffolding, boilerplate DDL — and I kept
 that output.
 
-It was not the source of the decisions that matter. The `DDMMYYYY` date of birth
-was found by running the brief's own sample through the parser and reading the
-failure, not by inspection; the assumption that one stated format applied to
-every column is exactly the kind of thing a model will reproduce confidently
-because it is what the document says. The same applies to binding columns by
-name rather than ordinal, treating an unmappable country as a routing failure
-rather than a cosmetic one, ordering the relocation `DELETE` after the `INSERT`,
-and arguing against the per-country split while still implementing it.
+It was not the source of the decisions that matter, and twice it was actively
+wrong in ways that would have shipped:
+
+- An AI review of the SQL flagged `REGEXP_SUBSTR(..., 'e', 1)` as invalid in
+  Snowflake. It is valid — `e` means "extract submatches". I checked the
+  documentation rather than applying the "fix", which would have broken working
+  code. The same review correctly caught a real defect: a session variable
+  inside a view definition, which makes the view non-reproducible.
+- The `1052022` → 5 October bug came from trusting `strptime` to fail loudly on
+  an ambiguous parse. It does not. Only running the supplied file exposed it,
+  and only reasoning about field width resolved it.
+
+The `DDMMYYYY` date of birth in the PDF was found the same way — by running the
+brief's own sample and reading the failure. A model reproduces what the document
+says, confidently, because that is what the document says.
 
 Three tests failed on first run and in all three cases my assertion was wrong
-and the implementation was right — the 90-day boundary is inclusive, and the
-clean sample has two orphan redemption members rather than one. Those were
-corrected in the tests rather than by bending the behaviour to match, which is
-the discipline that makes AI-accelerated work safe: the generated code is a
-proposal, and the tests plus the sample data are what decide.
+and the implementation right; those were corrected in the tests, not by bending
+the behaviour. That is the discipline that makes AI-accelerated work safe: the
+generated code is a proposal, and the tests plus the real data decide.
 
-The commit history shows the order this was built in.
+The source-contract work was done test-first — see the `[RED]` / `[GREEN]`
+commit pairs in the history.
