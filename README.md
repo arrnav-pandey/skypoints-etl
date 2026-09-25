@@ -1,5 +1,7 @@
 # SkyPoints — Member & Redemption Ingestion
 
+[![tests](https://github.com/arrnav-pandey/skypoints-etl/actions/workflows/tests.yml/badge.svg)](https://github.com/arrnav-pandey/skypoints-etl/actions/workflows/tests.yml)
+
 Incubyte Data Engineer technical assessment.
 
 A daily batch that takes two source feeds — a pipe-delimited flat file of member
