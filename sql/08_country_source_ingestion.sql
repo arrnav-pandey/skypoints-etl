@@ -189,22 +189,58 @@ SELECT
     t.DATE_OF_BIRTH,
     -- NULL, never 0, when no DOB was supplied: USA ships none at all and a
     -- fabricated age would silently corrupt every age-based segment.
+    --
+    -- Calendar arithmetic, not days/365.25. The approximation disagrees with
+    -- the true age near a birthday, and the Python implementation is
+    -- birthday-aware, so the two paths would return different ages for the
+    -- same member. DATE_FROM_PARTS normalises 29 Feb in a non-leap year to
+    -- 1 March, which matches how the Python side treats it.
     IFF(t.DATE_OF_BIRTH IS NULL, NULL,
-        FLOOR(DATEDIFF('day', t.DATE_OF_BIRTH, t.BATCH_DATE) / 365.25)) AS AGE,
+        DATEDIFF('year', t.DATE_OF_BIRTH, t.BATCH_DATE)
+        - IFF(
+            DATE_FROM_PARTS(YEAR(t.BATCH_DATE), MONTH(t.DATE_OF_BIRTH), DAY(t.DATE_OF_BIRTH))
+                > t.BATCH_DATE,
+            1, 0
+          )
+    ) AS AGE,
     IFF(t.LAST_FLIGHT_DATE IS NULL, NULL,
         DATEDIFF('day', t.LAST_FLIGHT_DATE, t.BATCH_DATE) > 90)         AS STALE_MEMBER,
+    -- A date that was sent but did not parse is the '2021-13-13' case. Every
+    -- declared date column is checked, not just the one the sample happens to
+    -- break: an unparseable DOB or flight date would otherwise pass as valid
+    -- carrying a silent NULL, which is exactly the failure this layer exists
+    -- to prevent.
     ARRAY_SIZE(ARRAY_COMPACT(ARRAY_CONSTRUCT(
         IFF(t.MEMBER_NAME IS NULL,     'mandatory_field:member_name',     NULL),
         IFF(t.MEMBER_ID IS NULL,       'mandatory_field:member_id',       NULL),
-        IFF(t.ENROLLMENT_DATE IS NULL, 'mandatory_field:enrollment_date', NULL)
+        IFF(t.ENROLLMENT_DATE IS NULL, 'mandatory_field:enrollment_date', NULL),
+        IFF(SKYPOINTS_STG.FN_NULLIFY(t.COLS:ENROLLMENT_DATE::VARCHAR) IS NOT NULL
+            AND t.ENROLLMENT_DATE IS NULL,
+            'date_valid_calendar:enrollment_date', NULL),
+        IFF(SKYPOINTS_STG.FN_NULLIFY(t.COLS:LAST_FLIGHT_DATE::VARCHAR) IS NOT NULL
+            AND t.LAST_FLIGHT_DATE IS NULL,
+            'date_valid_calendar:last_flight_date', NULL),
+        IFF(SKYPOINTS_STG.FN_NULLIFY(t.COLS:DATE_OF_BIRTH::VARCHAR) IS NOT NULL
+            AND t.DATE_OF_BIRTH IS NULL,
+            'date_valid_calendar:date_of_birth', NULL),
+        IFF(t.LAST_FLIGHT_DATE < t.ENROLLMENT_DATE,
+            'flight_after_enrollment', NULL)
     ))) = 0 AS IS_VALID,
     ARRAY_COMPACT(ARRAY_CONSTRUCT(
         IFF(t.MEMBER_NAME IS NULL,     'mandatory_field:member_name',     NULL),
         IFF(t.MEMBER_ID IS NULL,       'mandatory_field:member_id',       NULL),
-        -- A date that was sent but did not parse is the '2021-13-13' case:
-        -- month 13 has no defensible repair, so the record is quarantined.
-        IFF(t.COLS:ENROLLMENT_DATE IS NOT NULL AND t.ENROLLMENT_DATE IS NULL,
-            'date_valid_calendar:enrollment_date', NULL)
+        IFF(t.ENROLLMENT_DATE IS NULL, 'mandatory_field:enrollment_date', NULL),
+        IFF(SKYPOINTS_STG.FN_NULLIFY(t.COLS:ENROLLMENT_DATE::VARCHAR) IS NOT NULL
+            AND t.ENROLLMENT_DATE IS NULL,
+            'date_valid_calendar:enrollment_date', NULL),
+        IFF(SKYPOINTS_STG.FN_NULLIFY(t.COLS:LAST_FLIGHT_DATE::VARCHAR) IS NOT NULL
+            AND t.LAST_FLIGHT_DATE IS NULL,
+            'date_valid_calendar:last_flight_date', NULL),
+        IFF(SKYPOINTS_STG.FN_NULLIFY(t.COLS:DATE_OF_BIRTH::VARCHAR) IS NOT NULL
+            AND t.DATE_OF_BIRTH IS NULL,
+            'date_valid_calendar:date_of_birth', NULL),
+        IFF(t.LAST_FLIGHT_DATE < t.ENROLLMENT_DATE,
+            'flight_after_enrollment', NULL)
     )),
     ARRAY_COMPACT(ARRAY_CONSTRUCT(
         -- Not an error: an entire market simply does not collect DOB.

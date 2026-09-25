@@ -61,9 +61,20 @@ derived AS (
         c.*,
         -- Age in whole years, anchored on the batch date so the value is
         -- reproducible on re-run rather than drifting with the wall clock.
+        --
+        -- Calendar arithmetic rather than days/365.25: the approximation
+        -- disagrees with the true age either side of a birthday, and the
+        -- Python implementation is birthday-aware, so the two paths would
+        -- return different ages for the same member.
         CASE
             WHEN c.DATE_OF_BIRTH IS NULL THEN NULL
-            ELSE FLOOR(DATEDIFF('day', c.DATE_OF_BIRTH, c.BATCH_DATE) / 365.25)
+            ELSE DATEDIFF('year', c.DATE_OF_BIRTH, c.BATCH_DATE)
+                 - IFF(
+                     DATE_FROM_PARTS(
+                         YEAR(c.BATCH_DATE), MONTH(c.DATE_OF_BIRTH), DAY(c.DATE_OF_BIRTH)
+                     ) > c.BATCH_DATE,
+                     1, 0
+                   )
         END AS AGE,
         -- NULL (not FALSE) when the member has never flown: 'never flown' and
         -- 'has not flown recently' are different states and merging them would
