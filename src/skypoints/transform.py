@@ -18,6 +18,7 @@ from typing import Iterable, Iterator
 from .coerce import clean_text, parse_int, parse_source_date, upper
 from .config import PipelineConfig, conform_country, target_table
 from .models import Issue, RawRecord, Severity, StagedMember
+from .spec import FIELDS_BY_NAME
 from .validation import validate_member, validate_record
 
 
@@ -66,7 +67,10 @@ def stage_member(record: RawRecord, config: PipelineConfig) -> StagedMember:
     member.active_member = upper(record.get("active_member"))
 
     for column in ("enrollment_date", "last_flight_date", "date_of_birth"):
-        value, issue = parse_source_date(record.get(column), column)
+        spec = FIELDS_BY_NAME[column]
+        value, issue = parse_source_date(
+            record.get(column), column, spec.date_format, spec.alternate_date_formats
+        )
         setattr(member, column, value)
         if issue:
             member.issues.append(issue)

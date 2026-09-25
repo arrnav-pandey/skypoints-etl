@@ -17,6 +17,11 @@ file, and both are modelled explicitly rather than silently papered over:
    viable business key for a loyalty programme -- ``Member ID`` is.  Both are
    recorded: ``key_column`` mirrors the document, ``business_key`` reflects the
    key the pipeline actually deduplicates on.
+3. The document states one date format for the feed, but the sample date of
+   birth ``03051985`` is not a valid ``YYYYMMDD`` value (month 19, day 85).  It
+   is ``DDMMYYYY``.  Date format is therefore declared per field rather than
+   globally, so the dates that genuinely are ``YYYYMMDD`` (enrollment, last
+   flight) are not bent to fit the odd one out.
 """
 
 from __future__ import annotations
@@ -34,6 +39,13 @@ class DataType(str, Enum):
     CHAR = "CHAR"
     DATE = "DATE"
     INT = "INT"
+
+
+#: Date format declared by the File Name / Date-Time specification.
+SOURCE_DATE_FORMAT = "%Y%m%d"
+
+#: Format the sample date of birth actually uses (``03051985`` = 3 May 1985).
+DOB_DATE_FORMAT = "%d%m%Y"
 
 
 @dataclass(frozen=True)
@@ -55,6 +67,12 @@ class FieldSpec:
 
     business_key: bool = False
     """Used by the pipeline for deduplication / latest-record-wins."""
+
+    date_format: str = SOURCE_DATE_FORMAT
+    """``strptime`` format for DATE columns."""
+
+    alternate_date_formats: tuple[str, ...] = ()
+    """Formats tried if ``date_format`` fails, each one reported as drift."""
 
     def matches_header(self, header_name: str) -> bool:
         normalised = _normalise_header(header_name)
@@ -78,7 +96,12 @@ MEMBER_LAYOUT: tuple[FieldSpec, ...] = (
     # The alias is carried so the misspelling does not break ingestion.
     FieldSpec(8, "country", ("Country", "County"), 5, DataType.CHAR, False, False),
     FieldSpec(9, "post_code", ("Post_Code", "Post Code", "PostCode", "Zip"), 5, DataType.INT, False, False),
-    FieldSpec(10, "date_of_birth", ("DOB", "Date_Of_Birth", "Date of Birth"), 8, DataType.DATE, False, False),
+    FieldSpec(
+        10, "date_of_birth", ("DOB", "Date_Of_Birth", "Date of Birth"), 8,
+        DataType.DATE, False, False,
+        date_format=DOB_DATE_FORMAT,
+        alternate_date_formats=(SOURCE_DATE_FORMAT,),
+    ),
     FieldSpec(11, "active_member", ("Is_Active", "Active_Member", "FLAG"), 1, DataType.CHAR, False, False),
 )
 
@@ -88,9 +111,6 @@ MANDATORY_FIELDS: tuple[str, ...] = tuple(f.name for f in MEMBER_LAYOUT if f.man
 DECLARED_KEY_FIELDS: tuple[str, ...] = tuple(f.name for f in MEMBER_LAYOUT if f.key_column)
 BUSINESS_KEY_FIELDS: tuple[str, ...] = tuple(f.name for f in MEMBER_LAYOUT if f.business_key)
 DATE_FIELDS: tuple[str, ...] = tuple(f.name for f in MEMBER_LAYOUT if f.data_type is DataType.DATE)
-
-#: Source date format declared by the File Name / Date-Time specification.
-SOURCE_DATE_FORMAT = "%Y%m%d"
 
 #: Filename specification: ``SKYPOINTS_MEMBERS_YYYYMMDD_HHMMSSTT.dat``
 MEMBER_FILE_PATTERN = r"^(?P<prefix>[A-Z_]+)_(?P<date>\d{8})_(?P<time>\d{8})\.(?P<ext>dat|txt)$"
