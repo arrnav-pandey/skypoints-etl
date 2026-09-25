@@ -20,3 +20,4 @@ htmlcov/
 
 # Pipeline output is regenerated on every run
 out/
+out-real/
