@@ -22,6 +22,16 @@
 -- identity of the market, so a file whose name cannot be resolved is refused
 -- rather than defaulted -- guessing would route real members into the wrong
 -- country's table.
+--
+-- A note on Excel. Snowflake's COPY INTO supports CSV, JSON, Parquet, Avro,
+-- ORC and XML -- not XLSX. A workbook therefore cannot land directly, and
+-- RAW_COUNTRY_FEED assumes the ingestion layer has already converted it (which
+-- is what skypoints.sources does when reading AUS.xlsx). In production the
+-- right answer is to stop accepting Excel from a partner at all: it is an
+-- interchange format for humans, carries per-cell types, and silently reformats
+-- values. Where a partner cannot change, the conversion belongs at the edge --
+-- in the landing job -- so that everything downstream of RAW_COUNTRY_FEED sees
+-- one uniform shape.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -163,7 +173,11 @@ WITH mapped AS (
       ON c.COUNTRY_CODE = r.COUNTRY_CODE
      AND c.IS_ACTIVE
     WHERE r.BATCH_DATE = TO_DATE($BATCH_DATE)
-    GROUP BY r.COUNTRY_CODE, r.SOURCE_FILE_NAME, r.SOURCE_FILE_ROW, r.BATCH_DATE, r.PAYLOAD
+    -- Grouped on the identity key, not on PAYLOAD. Grouping by a VARIANT is
+    -- both needlessly expensive and semantically awkward, and RAW_FEED_SK
+    -- already identifies the row uniquely.
+    GROUP BY r.RAW_FEED_SK, r.COUNTRY_CODE, r.SOURCE_FILE_NAME,
+             r.SOURCE_FILE_ROW, r.BATCH_DATE
 ),
 typed AS (
     SELECT
