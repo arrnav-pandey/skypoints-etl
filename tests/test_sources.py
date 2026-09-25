@@ -10,6 +10,7 @@ Written before the readers exist: red first, then green.
 
 from __future__ import annotations
 
+import inspect
 from datetime import date
 from pathlib import Path
 
@@ -17,11 +18,69 @@ import pytest
 
 from skypoints.sources import (
     SOURCE_CONTRACTS,
+    CrossCountryIdTracker,
+    iter_source,
     read_source,
     resolve_contract,
 )
 
 INCOMING = Path(__file__).resolve().parents[1] / "data" / "incoming"
+
+
+# --- laziness -------------------------------------------------------------
+
+def test_source_reading_is_lazy():
+    # The reader must not materialise the file. read_source() is a convenience
+    # that collects the stream; iter_source() is the one the pipeline uses, and
+    # it has to yield without having read to the end first.
+    stream = iter_source(INCOMING / "USA.csv")
+
+    assert inspect.isgenerator(stream)
+    assert next(stream).member_name == "Sam"
+    stream.close()
+
+
+def test_xlsx_reading_is_lazy():
+    stream = iter_source(INCOMING / "AUS.xlsx")
+
+    assert inspect.isgenerator(stream)
+    assert next(stream).member_name == "Mike"
+    stream.close()
+
+
+# --- collision tracking without retaining the population ------------------
+
+def test_collision_tracker_keeps_ids_not_members():
+    # Cross-country collisions need per-ID state, not the members themselves.
+    # Holding every StagedMember would make the population the memory bound;
+    # holding a small set per distinct ID makes distinct-ID count the bound.
+    tracker = CrossCountryIdTracker()
+    for member in iter_source(INCOMING / "USA.csv"):
+        tracker.observe(member)
+    for member in iter_source(INCOMING / "IND.csv"):
+        tracker.observe(member)
+
+    assert tracker.collisions() == {"1": ["IND", "USA"], "2": ["IND", "USA"], "3": ["IND", "USA"]}
+    assert tracker.distinct_keys == 6
+
+
+def test_collision_tracker_reports_whether_names_differ():
+    # Different names under one ID is evidence the ID namespaces are not
+    # globally stable, which is why the records are not merged.
+    tracker = CrossCountryIdTracker()
+    for path in ("USA.csv", "IND.csv"):
+        for member in iter_source(INCOMING / path):
+            tracker.observe(member)
+
+    assert tracker.names_differ("1") is True
+
+
+def test_single_country_ids_are_not_collisions():
+    tracker = CrossCountryIdTracker()
+    for member in iter_source(INCOMING / "USA.csv"):
+        tracker.observe(member)
+
+    assert tracker.collisions() == {}
 
 
 # --- country is carried by the filename, not by a column -------------------
