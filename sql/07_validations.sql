@@ -1,41 +1,55 @@
 -- =============================================================================
 -- 07 - Data validations (deliverable 5)
 -- =============================================================================
--- Every check returns a uniform shape (CHECK_NAME, SEVERITY, FAILED_ROWS,
--- SAMPLE) so the suite can be run as one statement and gated on mechanically.
--- A validation that a human has to eyeball is a validation that stops being run.
+-- Every check returns a uniform shape (CHECK_NAME, SEVERITY, BATCH_DATE,
+-- FAILED_ROWS, SAMPLE) so the suite can be run as one statement and gated on
+-- mechanically. A validation that a human has to eyeball is a validation that
+-- stops being run.
 --
 -- Severity is the design decision that matters here. Blocking on every warning
 -- means the pipeline halts nightly and people start ignoring it; blocking on
 -- nothing means bad data reaches the business. So:
 --   ERROR   - the record cannot be loaded correctly. Quarantine it.
 --   WARNING - the record is loadable but something is degrading. Report it.
+--
+-- The view deliberately contains NO session variable and NO batch filter. A
+-- view whose result depends on session state is not reproducible: two people
+-- querying it get different answers, and it cannot be safely scheduled or
+-- shared. So the checks aggregate BY batch and the caller filters to the batch
+-- it cares about. This also makes the suite retrospective for free -- the same
+-- view shows whether last Tuesday's load was clean.
+--
+-- Checks that are global rather than per-batch (cross-country uniqueness,
+-- orphan transactions) report a NULL batch date and are always evaluated.
 -- =============================================================================
-
-SET BATCH_DATE = '2024-01-15';
 
 CREATE OR REPLACE VIEW SKYPOINTS_STG.V_VALIDATION_RESULTS AS
 
 -- --------------------------------------------------------------------------
 -- 1. Mandatory field checks (contract: Member Name, Member ID, Enrollment Date)
 -- --------------------------------------------------------------------------
-SELECT 'mandatory_member_name'   AS CHECK_NAME, 'ERROR' AS SEVERITY,
-       COUNT(*) AS FAILED_ROWS,
-       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW) AS SAMPLE
+SELECT 'mandatory_member_name' AS CHECK_NAME,
+       'ERROR'                 AS SEVERITY,
+       BATCH_DATE              AS BATCH_DATE,
+       COUNT(*)                AS FAILED_ROWS,
+       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)::VARCHAR AS SAMPLE
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE) AND MEMBER_NAME IS NULL
+WHERE MEMBER_NAME IS NULL
+GROUP BY BATCH_DATE
 
 UNION ALL
-SELECT 'mandatory_member_id', 'ERROR', COUNT(*),
-       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)
+SELECT 'mandatory_member_id', 'ERROR', BATCH_DATE, COUNT(*),
+       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE) AND MEMBER_ID IS NULL
+WHERE MEMBER_ID IS NULL
+GROUP BY BATCH_DATE
 
 UNION ALL
-SELECT 'mandatory_enrollment_date', 'ERROR', COUNT(*),
-       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)
+SELECT 'mandatory_enrollment_date', 'ERROR', BATCH_DATE, COUNT(*),
+       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE) AND ENROLLMENT_DATE IS NULL
+WHERE ENROLLMENT_DATE IS NULL
+GROUP BY BATCH_DATE
 
 -- --------------------------------------------------------------------------
 -- 2. Key-column uniqueness
@@ -45,17 +59,19 @@ WHERE BATCH_DATE = TO_DATE($BATCH_DATE) AND ENROLLMENT_DATE IS NULL
 -- reasons: duplicates within a batch are a source problem, duplicates across
 -- country tables are a routing problem (a relocation whose DELETE was missed).
 UNION ALL
-SELECT 'unique_member_id_in_batch', 'ERROR', COUNT(*), ANY_VALUE(MEMBER_ID)
+SELECT 'unique_member_id_in_batch', 'ERROR', BATCH_DATE, COUNT(*),
+       ANY_VALUE(MEMBER_ID)::VARCHAR
 FROM (
-    SELECT MEMBER_ID
+    SELECT BATCH_DATE, MEMBER_ID
     FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-    WHERE BATCH_DATE = TO_DATE($BATCH_DATE)
-    GROUP BY MEMBER_ID
+    GROUP BY BATCH_DATE, MEMBER_ID
     HAVING COUNT(*) > 1
 )
+GROUP BY BATCH_DATE
 
 UNION ALL
-SELECT 'member_in_exactly_one_country', 'ERROR', COUNT(*), ANY_VALUE(MEMBER_ID)
+SELECT 'member_in_exactly_one_country', 'ERROR', NULL::DATE, COUNT(*),
+       ANY_VALUE(MEMBER_ID)::VARCHAR
 FROM (
     SELECT MEMBER_ID
     FROM SKYPOINTS_TGT.V_MEMBER_GLOBAL
@@ -64,10 +80,12 @@ FROM (
 )
 
 UNION ALL
-SELECT 'unique_txn_id', 'ERROR', COUNT(*), ANY_VALUE(TXN_ID)
+SELECT 'unique_txn_id', 'ERROR', NULL::DATE, COUNT(*), ANY_VALUE(TXN_ID)::VARCHAR
 FROM (
-    SELECT TXN_ID FROM SKYPOINTS_TGT.REDEMPTION_TXN
-    GROUP BY TXN_ID HAVING COUNT(*) > 1
+    SELECT TXN_ID
+    FROM SKYPOINTS_TGT.REDEMPTION_TXN
+    GROUP BY TXN_ID
+    HAVING COUNT(*) > 1
 )
 
 -- --------------------------------------------------------------------------
@@ -77,27 +95,30 @@ FROM (
 --     loses its leading zero. Called out on its own because the fix is in the
 --     source system's cast, not in this data.
 UNION ALL
-SELECT 'date_leading_zero_lost', 'ERROR', COUNT(*),
-       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)
+SELECT 'date_leading_zero_lost', 'ERROR', BATCH_DATE, COUNT(*),
+       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)::VARCHAR
 FROM SKYPOINTS_RAW.RAW_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE)
-  AND RECORD_TAG = 'D'
-  AND (LENGTH(TRIM(DATE_OF_BIRTH)) = 7 OR LENGTH(TRIM(ENROLLMENT_DATE)) = 7
+WHERE RECORD_TAG = 'D'
+  AND (LENGTH(TRIM(DATE_OF_BIRTH)) = 7
+       OR LENGTH(TRIM(ENROLLMENT_DATE)) = 7
        OR LENGTH(TRIM(LAST_FLIGHT_DATE)) = 7)
+GROUP BY BATCH_DATE
 
 -- 3b. Country codes are inconsistent in the sample ('PHIL', 'AU' vs ISO
 --     alpha-3). Anything unmapped cannot be routed, so it is an ERROR: the
 --     member would otherwise reach no country table at all.
 UNION ALL
-SELECT 'country_unmappable', 'ERROR', COUNT(*), ANY_VALUE(COUNTRY)
+SELECT 'country_unmappable', 'ERROR', BATCH_DATE, COUNT(*), ANY_VALUE(COUNTRY)::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE) AND COUNTRY_CODE = 'UNK'
+WHERE COUNTRY_CODE = 'UNK'
+GROUP BY BATCH_DATE
 
 -- 3c. Referential integrity between the two feeds. Redemptions for members who
 --     do not exist usually mean the feeds arrived out of step, which is worth
 --     knowing before someone reconciles mileage liability.
 UNION ALL
-SELECT 'orphan_redemption_member', 'WARNING', COUNT(*), ANY_VALUE(t.MEMBER_ID)
+SELECT 'orphan_redemption_member', 'WARNING', NULL::DATE, COUNT(*),
+       ANY_VALUE(t.MEMBER_ID)::VARCHAR
 FROM SKYPOINTS_TGT.REDEMPTION_TXN t
 LEFT JOIN SKYPOINTS_TGT.V_MEMBER_GLOBAL m ON m.MEMBER_ID = t.MEMBER_ID
 WHERE m.MEMBER_ID IS NULL
@@ -106,55 +127,58 @@ WHERE m.MEMBER_ID IS NULL
 --     optional per the contract, so this is a completeness signal, not a
 --     rejection -- but a sudden jump in the rate means the source changed.
 UNION ALL
-SELECT 'agent_name_completeness', 'WARNING', COUNT(*), NULL
+SELECT 'agent_name_completeness', 'WARNING', BATCH_DATE, COUNT(*), NULL::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE) AND AGENT_NAME IS NULL
+WHERE AGENT_NAME IS NULL
+GROUP BY BATCH_DATE
 
 -- 3e. Every member in the sample shares the same DOB, enrolment and flight
 --     date. In real data that is a synthetic-data smell or a stuck upstream
 --     default. Cheap to check, and it catches a class of bug that row-level
 --     rules never will.
 UNION ALL
-SELECT 'suspicious_low_date_cardinality', 'WARNING',
+SELECT 'suspicious_low_date_cardinality', 'WARNING', BATCH_DATE,
        IFF(COUNT(DISTINCT DATE_OF_BIRTH) = 1 AND COUNT(*) > 10, COUNT(*), 0),
-       'all members share one date_of_birth'
+       'all members in the batch share one date_of_birth'::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE)
+GROUP BY BATCH_DATE
 
 -- --------------------------------------------------------------------------
 -- 4. Domain and cross-field checks
 -- --------------------------------------------------------------------------
 UNION ALL
-SELECT 'tier_code_domain', 'WARNING', COUNT(*), ANY_VALUE(TIER_CODE)
+SELECT 'tier_code_domain', 'WARNING', BATCH_DATE, COUNT(*), ANY_VALUE(TIER_CODE)::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE)
-  AND TIER_CODE IS NOT NULL
+WHERE TIER_CODE IS NOT NULL
   AND TIER_CODE NOT IN ('BAS','SLV','GLD','PLT','DIA')
+GROUP BY BATCH_DATE
 
 UNION ALL
-SELECT 'active_flag_domain', 'ERROR', COUNT(*), ANY_VALUE(ACTIVE_MEMBER)
+SELECT 'active_flag_domain', 'ERROR', BATCH_DATE, COUNT(*), ANY_VALUE(ACTIVE_MEMBER)::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE)
-  AND ACTIVE_MEMBER IS NOT NULL
+WHERE ACTIVE_MEMBER IS NOT NULL
   AND ACTIVE_MEMBER NOT IN ('A','I')
+GROUP BY BATCH_DATE
 
 UNION ALL
-SELECT 'flight_before_enrollment', 'ERROR', COUNT(*),
-       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)
+SELECT 'flight_before_enrollment', 'ERROR', BATCH_DATE, COUNT(*),
+       ANY_VALUE(SOURCE_FILE_NAME || ':' || SOURCE_FILE_ROW)::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE)
-  AND LAST_FLIGHT_DATE < ENROLLMENT_DATE
+WHERE LAST_FLIGHT_DATE < ENROLLMENT_DATE
+GROUP BY BATCH_DATE
 
 UNION ALL
-SELECT 'dob_implausible', 'ERROR', COUNT(*), ANY_VALUE(TO_VARCHAR(DATE_OF_BIRTH))
+SELECT 'dob_implausible', 'ERROR', BATCH_DATE, COUNT(*),
+       ANY_VALUE(TO_VARCHAR(DATE_OF_BIRTH))::VARCHAR
 FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-WHERE BATCH_DATE = TO_DATE($BATCH_DATE)
-  AND (DATE_OF_BIRTH > BATCH_DATE OR YEAR(DATE_OF_BIRTH) < 1900)
+WHERE DATE_OF_BIRTH > BATCH_DATE OR YEAR(DATE_OF_BIRTH) < 1900
+GROUP BY BATCH_DATE
 
 UNION ALL
-SELECT 'negative_miles', 'ERROR', COUNT(*), ANY_VALUE(TXN_ID)
+SELECT 'negative_miles', 'ERROR', BATCH_DATE, COUNT(*), ANY_VALUE(TXN_ID)::VARCHAR
 FROM SKYPOINTS_TGT.REDEMPTION_TXN
 WHERE MILES_REDEEMED < 0
+GROUP BY BATCH_DATE
 
 -- --------------------------------------------------------------------------
 -- 5. Reconciliation: rows in must equal rows out
@@ -164,16 +188,25 @@ WHERE MILES_REDEEMED < 0
 -- during routing. Without it, "the job succeeded" and "the data is complete"
 -- are different statements that look identical.
 UNION ALL
-SELECT 'row_count_reconciliation', 'ERROR',
-       ABS(
-           (SELECT COUNT(*) FROM SKYPOINTS_RAW.RAW_MEMBER_PROFILE
-            WHERE BATCH_DATE = TO_DATE($BATCH_DATE) AND RECORD_TAG = 'D')
-         - (SELECT COUNT(*) FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
-            WHERE BATCH_DATE = TO_DATE($BATCH_DATE))
-         - (SELECT COUNT(*) FROM SKYPOINTS_STG.QUARANTINE_MEMBER_PROFILE
-            WHERE BATCH_DATE = TO_DATE($BATCH_DATE))
-       ),
-       'raw detail rows must equal staged + quarantined'
+SELECT 'row_count_reconciliation', 'ERROR', BATCH_DATE,
+       ABS(SUM(RAW_ROWS) - SUM(STG_ROWS) - SUM(QTN_ROWS)),
+       ('raw=' || SUM(RAW_ROWS) || ' staged=' || SUM(STG_ROWS)
+        || ' quarantined=' || SUM(QTN_ROWS))::VARCHAR
+FROM (
+    SELECT BATCH_DATE, COUNT(*) AS RAW_ROWS, 0 AS STG_ROWS, 0 AS QTN_ROWS
+    FROM SKYPOINTS_RAW.RAW_MEMBER_PROFILE
+    WHERE RECORD_TAG = 'D'
+    GROUP BY BATCH_DATE
+    UNION ALL
+    SELECT BATCH_DATE, 0, COUNT(*), 0
+    FROM SKYPOINTS_STG.STG_MEMBER_PROFILE
+    GROUP BY BATCH_DATE
+    UNION ALL
+    SELECT BATCH_DATE, 0, 0, COUNT(*)
+    FROM SKYPOINTS_STG.QUARANTINE_MEMBER_PROFILE
+    GROUP BY BATCH_DATE
+)
+GROUP BY BATCH_DATE
 
 -- --------------------------------------------------------------------------
 -- 6. Volume anomaly
@@ -182,20 +215,31 @@ SELECT 'row_count_reconciliation', 'ERROR',
 -- likely to be a truncated delivery than a genuine drop in enrolment. Catching
 -- it before the load is cheaper than explaining the dashboard afterwards.
 UNION ALL
-SELECT 'volume_anomaly', 'WARNING',
-       IFF(TODAY_ROWS < PRIOR_AVG * 0.5 OR TODAY_ROWS > PRIOR_AVG * 2, 1, 0),
-       'today=' || TODAY_ROWS || ' prior_avg=' || ROUND(PRIOR_AVG)
+SELECT 'volume_anomaly', 'WARNING', BATCH_DATE,
+       IFF(ROWS_TODAY < PRIOR_AVG * 0.5 OR ROWS_TODAY > PRIOR_AVG * 2, 1, 0),
+       ('today=' || ROWS_TODAY || ' prior_avg=' || ROUND(PRIOR_AVG, 1))::VARCHAR
 FROM (
-    SELECT
-        COUNT_IF(BATCH_DATE = TO_DATE($BATCH_DATE))                       AS TODAY_ROWS,
-        COUNT_IF(BATCH_DATE <  TO_DATE($BATCH_DATE)
-                 AND BATCH_DATE >= DATEADD('day', -7, TO_DATE($BATCH_DATE))) / 7.0 AS PRIOR_AVG
+    SELECT BATCH_DATE,
+           COUNT(*) AS ROWS_TODAY,
+           AVG(COUNT(*)) OVER (
+               ORDER BY BATCH_DATE
+               ROWS BETWEEN 7 PRECEDING AND 1 PRECEDING
+           ) AS PRIOR_AVG
     FROM SKYPOINTS_RAW.RAW_MEMBER_PROFILE
-);
+    WHERE RECORD_TAG = 'D'
+    GROUP BY BATCH_DATE
+)
+WHERE PRIOR_AVG IS NOT NULL;
 
--- --------------------------------------------------------------------------
--- Gate: fail the run on any ERROR-severity breach
--- --------------------------------------------------------------------------
-SELECT * FROM SKYPOINTS_STG.V_VALIDATION_RESULTS
+-- =============================================================================
+-- Gate: fail the run on any ERROR-severity breach for the batch being loaded
+-- =============================================================================
+-- The batch filter lives here, in the caller, not in the view. Global checks
+-- carry a NULL batch date and are always included.
+SET BATCH_DATE = '2024-01-15';
+
+SELECT CHECK_NAME, SEVERITY, BATCH_DATE, FAILED_ROWS, SAMPLE
+FROM SKYPOINTS_STG.V_VALIDATION_RESULTS
 WHERE FAILED_ROWS > 0
+  AND (BATCH_DATE = TO_DATE($BATCH_DATE) OR BATCH_DATE IS NULL)
 ORDER BY DECODE(SEVERITY, 'ERROR', 1, 'WARNING', 2), FAILED_ROWS DESC;
