@@ -42,3 +42,13 @@ jobs:
           test -f out/targets/table_india.csv
           test -f out/targets/redemption_txn.csv
           test -f out/run_report.json
+
+      # Exercises the supplied country feeds, including the .xlsx path, which
+      # depends on openpyxl and so can break independently of everything else.
+      - name: Smoke test ingestion of the supplied country feeds
+        run: |
+          skypoints ingest --dir data/incoming --as-of 2022-12-31 --out out-real
+          test -f out-real/targets/table_usa.csv
+          test -f out-real/targets/table_india.csv
+          test -f out-real/targets/table_australia.csv
+          test -f out-real/quarantine.csv
